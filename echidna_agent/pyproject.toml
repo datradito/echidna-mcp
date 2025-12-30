@@ -1,0 +1,35 @@
+[project]
+name = "echidna-agent"
+version = "0.1.0"
+description = "AI Agents for Echidna MCP"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=0.3.0",
+    "langgraph>=0.2.0",
+    "mcp>=1.0.0",
+    "psycopg[binary]>=3.2.0",
+    "pydantic>=2.9.0",
+    "openai>=1.50.0",
+    "python-dotenv>=1.0.0",
+    "langchain-openai>=1.1.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/echidna_agent"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["../tests/echidna_agent"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]
