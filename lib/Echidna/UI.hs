@@ -104,8 +104,20 @@ ui vm dict initialCorpus cliSelectedContract = do
     Interactive -> do
       -- Channel to push events to update UI
       uiChannel <- liftIO $ newBChan 1000
-      let forwardEvent = void . writeBChanNonBlocking uiChannel . EventReceived
+      logBuffer <- newIORef []
+
+      let forwardEvent ev = do
+            msg <- runReaderT (ppLogLine vm ev) env
+            liftIO $ atomicModifyIORef' logBuffer (\logs -> (pack msg : logs, ()))
+            void $ writeBChanNonBlocking uiChannel $ EventReceived ev
+
       uiEventsForwarderStopVar <- spawnListener forwardEvent
+
+      case conf.campaignConf.serverPort of
+        Just port -> do
+          liftIO $ pushCampaignEvent env (ServerLog ("MCP Server running at http://127.0.0.1:" ++ show port ++ "/mcp"))
+          void $ liftIO $ forkIO $ runMCPServer env (map snd workers) (fromIntegral port) logBuffer
+        Nothing -> pure ()
 
       ticker <- liftIO . forkIO . forever $ do
         threadDelay 200_000 -- 200 ms
@@ -185,7 +197,7 @@ ui vm dict initialCorpus cliSelectedContract = do
 
       let forwardEvent ev = do
             msg <- runReaderT (ppLogLine vm ev) env
-            liftIO $ atomicModifyIORef' logBuffer (\logs -> (take 100 (pack msg : logs), ()))
+            liftIO $ atomicModifyIORef' logBuffer (\logs -> (pack msg : logs, ()))
             putStrLn msg
       uiEventsForwarderStopVar <- spawnListener forwardEvent
 
@@ -197,13 +209,15 @@ ui vm dict initialCorpus cliSelectedContract = do
             states <- liftIO $ workerStates workers
             time <- timePrefix <$> getTimestamp
             line <- statusLine env states lastUpdateRef
-            putStrLn $ time <> "[status] " <> line
+            let statusMsg = time <> "[status] " <> line
+            putStrLn statusMsg
             hFlush stdout
+            liftIO $ atomicModifyIORef' logBuffer (\logs -> (pack statusMsg : logs, ()))
 
       case conf.campaignConf.serverPort of
         Just port -> do
           liftIO $ pushCampaignEvent env (ServerLog ("MCP Server running at http://127.0.0.1:" ++ show port ++ "/mcp"))
-          void $ liftIO $ forkIO $ runMCPServer env (fromIntegral port) logBuffer
+          void $ liftIO $ forkIO $ runMCPServer env (map snd workers) (fromIntegral port) logBuffer
         Nothing -> pure ()
 
       ticker <- liftIO . forkIO . forever $ do

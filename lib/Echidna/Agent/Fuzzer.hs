@@ -10,7 +10,7 @@ import Control.Concurrent.STM (atomically, tryReadTChan, dupTChan, putTMVar)
 import Control.Monad (replicateM, void, forM_, when)
 import Control.Monad.Reader (runReaderT, liftIO, asks, MonadReader, ask)
 import Control.Monad.State.Strict (runStateT, get, gets, modify', MonadState)
-import Control.Monad.Random.Strict (evalRandT, MonadRandom, RandT)
+import Control.Monad.Random.Strict (evalRandT, MonadRandom, RandT, getRandom, getRandomR)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Trans (lift)
 import Control.Monad.IO.Class (MonadIO)
@@ -18,6 +18,8 @@ import System.Random (mkStdGen)
 import Data.IORef (IORef, writeIORef, readIORef, atomicModifyIORef')
 import Data.Map (Map)
 import qualified Data.Map as Map
+import qualified Data.Set as Set
+import Data.Text (Text)
 import System.Directory (getCurrentDirectory)
 
 import Echidna.Output.Source (saveLcovHook)
@@ -25,11 +27,14 @@ import EVM.Dapp (DappInfo(..))
 import EVM.Types (VM(..), VMType(Concrete), Expr(..), EType(..), Contract)
 import qualified EVM.Types as EVM
 
+import EVM.ABI (AbiValue)
 import Echidna.ABI (GenDict(..))
 import Echidna.Execution (replayCorpus, callseq, updateTests)
 import Echidna.Mutator.Corpus (getCorpusMutation, seqMutatorsStateless, seqMutatorsStateful, fromConsts)
 import Echidna.Shrink (shrinkTest)
-import Echidna.Transaction (genTx)
+import Echidna.Transaction (genTx, genTxFromPrototype)
+import Echidna.Types.Random (rElem)
+import qualified Data.List.NonEmpty as NE
 import Echidna.Types.Agent
 import Echidna.Types.Campaign (WorkerState(..), CampaignConf(..))
 import Echidna.Types.Config (Env(..), EConfig(..))
@@ -77,7 +82,7 @@ instance Agent FuzzerAgent where
           , ncalls = 0
           , totalGas = 0
           , runningThreads = []
-          , prioritizedFunctions = []
+          , prioritizedSequences = []
           }
 
     -- Callback to update the IORef with the current state
@@ -167,7 +172,7 @@ fuzzerLoop callback vm testLimit bus = do
        | otherwise ->
          callback >> pure TestLimitReached
 
-  fuzz = randseq vm.env.contracts >>= fmap fst . callseq vm
+  fuzz = randseq vm.env.contracts >>= fmap fst . (\txs -> callseq vm txs False)
 
   shrink = do
     wid <- gets (.workerId)
@@ -196,20 +201,20 @@ fuzzerLoop callback vm testLimit bus = do
                void $ saveLcovHook env dir env.sourceCache contracts
                putStrLn $ "Fuzzer " ++ show workerId ++ ": dumped LCOV coverage."
             pure ()
-       Just (WrappedMessage _ (ToFuzzer tid (PrioritizeFunction funcName))) -> do
+       Just (WrappedMessage _ (ToFuzzer tid (FuzzSequence txs prob))) -> do
           workerId <- gets (.workerId)
           when (tid == workerId) $ do
-             modify' $ \s -> s { prioritizedFunctions = funcName : s.prioritizedFunctions }
+             modify' $ \s -> s { prioritizedSequences = (prob, txs) : s.prioritizedSequences }
              pure ()
        Just (WrappedMessage _ (ToFuzzer tid ClearPrioritization)) -> do
           workerId <- gets (.workerId)
           when (tid == workerId) $ do
-             modify' $ \s -> s { prioritizedFunctions = [] }
+             modify' $ \s -> s { prioritizedSequences = [] }
              pure ()
        Just (WrappedMessage _ (ToFuzzer tid (ExecuteSequence txs replyVar))) -> do
           workerId <- gets (.workerId)
           when (tid == workerId) $ do
-             (_, newCov) <- callseq vm txs
+             (_, newCov) <- callseq vm txs False
              liftIO $ case replyVar of
                 Just var -> atomically $ putTMVar var newCov
                 Nothing -> pure ()
@@ -223,21 +228,98 @@ randseq
   => Map (Expr 'EAddr) Contract
   -> m [Tx]
 randseq deployedContracts = do
-  env <- ask
-  let world = env.world
+  -- 1. Check for prioritized sequences injected via tools
+  prioritized <- gets (.prioritizedSequences)
 
-  let
-    mutConsts = env.cfg.campaignConf.mutConsts
-    seqLen = env.cfg.campaignConf.seqLen
+  mbSeq <- if null prioritized
+           then pure Nothing
+           else do
+             -- Select a prioritized sequence based on probability
+             (prob, seqPrototype) <- rElem (NE.fromList prioritized)
+             useIt <- (<= prob) <$> getRandom
+             pure $ if useIt then Just seqPrototype else Nothing
 
-  -- Generate new random transactions
-  randTxs <- replicateM seqLen (genTx world deployedContracts)
-  -- Generate a random mutator
-  cmut <- if seqLen == 1 then seqMutatorsStateless (fromConsts mutConsts)
-                         else seqMutatorsStateful (fromConsts mutConsts)
-  -- Fetch the mutator
-  let mut = getCorpusMutation cmut
-  corpus <- liftIO $ readIORef env.corpusRef
-  if null corpus
-    then pure randTxs -- Use the generated random transactions
-    else mut seqLen corpus randTxs -- Apply the mutator
+  case mbSeq of
+    Just seqPrototype -> genPrioritizedSeq deployedContracts seqPrototype
+    Nothing -> genStandardSeq deployedContracts
+
+-- | Generate a sequence of transactions based on a prioritized prototype
+genPrioritizedSeq
+  :: (MonadRandom m, MonadReader Env m, MonadState WorkerState m, MonadIO m)
+  => Map (Expr 'EAddr) Contract
+  -> [(Text, [Maybe AbiValue])]
+  -> m [Tx]
+genPrioritizedSeq deployedContracts seqPrototype = do
+       env <- ask
+       let world = env.world
+           seqLen = env.cfg.campaignConf.seqLen
+
+       -- 2. If a prioritized sequence is selected:
+       -- Expand the prototype into concrete transactions
+       let expandPrototype [] = return []
+           expandPrototype [p] = do
+               tx <- genTxFromPrototype world deployedContracts p
+               return [tx]
+           expandPrototype (p:ps) = do
+               tx <- genTxFromPrototype world deployedContracts p
+               -- Insert random transactions between prototype transactions to increase fuzzing diversity
+               n <- getRandomR (0, 3)
+               rndTxs <- replicateM n (genTx world deployedContracts)
+               rest <- expandPrototype ps
+               return ((tx : rndTxs) ++ rest)
+
+       expandedTxs <- expandPrototype seqPrototype
+       corpusSet <- liftIO $ readIORef env.corpusRef
+       wid <- gets (.workerId)
+
+       -- Select a prefix from the existing corpus
+       -- Special handling for worker 0: always use empty prefix (position 0)
+       prefix <- if Set.null corpusSet || wid == 0
+                 then pure []
+                 else do
+                   -- Pick a random sequence from corpus
+                   idx <- getRandomR (0, Set.size corpusSet - 1)
+                   let (_, cTxs) = Set.elemAt idx corpusSet
+                   let middleLen = length expandedTxs
+                   let maxPrefix = seqLen - middleLen
+                   if maxPrefix <= 0
+                     then pure []
+                     else do
+                       -- Take a random prefix length
+                       k <- getRandomR (0, min (length cTxs) maxPrefix)
+                       pure (take k cTxs)
+
+       let combined = prefix ++ expandedTxs
+       let len = length combined
+
+       -- Pad with random transactions if sequence is too short
+       if len < seqLen
+         then do
+           paddingTxs <- replicateM (seqLen - len) (genTx world deployedContracts)
+           pure (combined ++ paddingTxs)
+         else
+           pure (take seqLen combined)
+
+-- | Generate a sequence of transactions using standard fuzzing techniques
+genStandardSeq
+  :: (MonadRandom m, MonadReader Env m, MonadState WorkerState m, MonadIO m)
+  => Map (Expr 'EAddr) Contract
+  -> m [Tx]
+genStandardSeq deployedContracts = do
+       env <- ask
+       let world = env.world
+           mutConsts = env.cfg.campaignConf.mutConsts
+           seqLen = env.cfg.campaignConf.seqLen
+
+       -- 3. Standard fuzzing behavior (no prioritized sequence selected)
+       -- Generate new random transactions
+       randTxs <- replicateM seqLen (genTx world deployedContracts)
+       -- Generate a random mutator
+       cmut <- if seqLen == 1 then seqMutatorsStateless (fromConsts mutConsts)
+                              else seqMutatorsStateful (fromConsts mutConsts)
+       -- Fetch the mutator
+       let mut = getCorpusMutation cmut
+       corpus <- liftIO $ readIORef env.corpusRef
+       if null corpus
+         then pure randTxs -- Use the generated random transactions
+         else mut seqLen corpus randTxs -- Apply the mutator
